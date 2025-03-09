@@ -1,0 +1,820 @@
+---
+title: 'Causal Inference: the Effect of Class Size on Test Scores'
+author: "Qingyu Chen"
+date: "2025-02-28"
+output: html_document
+---
+
+# Project Introduction
+
+This project examines the effect of **Grade 1 class size reduction** on students' **reading achievement** using a public dataset from the **Early Childhood Longitudinal Study-Kindergarten Cohort (ECLS-K) 1998**   ([NCES](https://nces.ed.gov/ecls/Kindergarten.asp)). The goal is to estimate whether students in **small classes (≤19 students)** perform better in reading than those in **regular classes (≥20 students)**.  
+
+To address potential selection bias, I use five causal inference method to test the Average Treatment on Treated (ATT) and Average Treatment Effect (ATE), including:  
+- **Propensity Score Matching (PSM)**  
+- **Inverse Probability of Treatment Weighting (IPTW)**  
+- **Marginal Mean Weighting through Stratification (MMWS)**  
+- **Instrumental Variable (IV)**  
+- **Difference-in-Differences (DID)**  
+
+
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+library(haven) 
+library(dplyr) 
+library(Hmisc) 
+library(MatchIt) 
+library(ggplot2)
+library(tableone)
+library(cobalt)
+library(twang)
+library(PSweight)
+library(knitr)
+library(broom)
+library(kableExtra)
+library(AER)
+library(plm)
+library(systemfit)
+library(tidyverse)
+library(fixest)
+```
+
+
+
+### 0. Data Cleaning
+
+```{r}
+# Upload dataset and name it df1
+data_url <- "https://raw.githubusercontent.com/QingyuChen-Joi/R_Coding_Sample/main/ECLSK98_class_size.dta"
+df1 <- read_dta(url(data_url))
+
+# Clean data set
+df_cleaned <- df1 %>%
+  # Missing values in gender variable are labled as 3
+  mutate(gender3 = ifelse(GENDER == -9, 3, GENDER)) %>% 
+  # Create 6 categories of race
+  mutate(race6 = case_when(RACE %in% c(3, 4) ~ 3/4,
+                          RACE %in% c(6, 7) ~ 6/7,
+                          RACE %in% c(-9, 8) ~ 8/-9,
+                          RACE == 1 ~ 1,
+                          RACE == 2 ~ 2,
+                          RACE == 5 ~ 5)) %>%
+  # Set missing value in the whole data set to NA
+  mutate(across(everything(), ~ifelse(. == -1 |. == -9, NA, .))) %>% 
+  # For general missing
+  mutate(race6 = as.factor(race6)) %>%
+  mutate(clsize = case_when(
+    A4CLSIZE <=19 ~ "Small",
+    A4CLSIZE >=20 ~ "Regular"
+  )) #For grade 1 class size
+
+# Create indicator variables for continuous covariates
+continuous_covs <- c("C1RRSCAL", "C2RRSCAL", "C1R2MSCL", "C2R2MSCL", "B4YRSTC")
+for (var_name in continuous_covs) {
+  df_cleaned[[paste0("missing_", var_name)]] <- ifelse(is.na(df_cleaned[[var_name]]), 1, 0)
+  df_cleaned[[var_name]] <- ifelse(is.na(df_cleaned[[var_name]]), mean(df_cleaned[[var_name]], na.rm=TRUE), df_cleaned[[var_name]])
+}
+
+# Create indicator variables for categorical covariates
+categorical_vars <- c("A4CLSIZE", "gender3", "race6", "clsize")
+for (var_name in categorical_vars) {
+  df_cleaned[[paste0("missing_", var_name)]] <- ifelse(is.na(df_cleaned[[var_name]]), 1, 0)
+  df_cleaned[[var_name]] <- ifelse(is.na(df_cleaned[[var_name]]), NA, df_cleaned[[var_name]])
+}
+
+# Filter observations without valid reading score and class size data
+df_cleaned <- df_cleaned %>%
+  filter(!is.na(C4RRSCAL)) %>%
+  filter(!is.na(clsize))
+```
+
+### 1. Compare the Baseline of Control and Treated
+
+The average score of small class students is slightly lower than regular class students, but the difference is very small and not significant.
+effect size: the effect size is -0.0093 which is very close to zero, which means the prima facie effect of class size on reading score is very small.
+
+```{r}
+# Compute mean and standard deviation
+df_q1 <- df_cleaned %>%
+  filter(!is.na(clsize)) %>%
+  group_by(clsize) %>%
+  summarise(
+    mean.y = mean(C4RRSCAL, na.rm = TRUE),
+            sd.y = sd(C4RRSCAL, na.rm = TRUE)
+    )
+
+# Compute between-group average difference
+t_test_result <- t.test(C4RRSCAL ~ clsize, data = df_cleaned, var.equal = TRUE)
+mean_diff <- t_test_result$estimate[2] - 
+  t_test_result$estimate[1] # control-treated
+
+# Compute Standard Error and P value
+std_error <- t_test_result$stderr
+p_value <- t_test_result$p.value
+
+# Compute effect size(Cohen's d, using the sd of control group)
+control_sd <- df_q1$sd.y[df_q1$clsize == "Regular"]
+effect_size <- mean_diff / control_sd
+
+# Print results to table
+result_table <- data.frame(
+  Metric = c("Mean Difference", "Standard Error", "P-value", "Effect Size"),
+  Value = c(mean_diff, std_error, p_value, effect_size)
+)
+print(result_table)
+```
+### 2. Construct Propensity Score and Identify Common Support
+
+###### 2.1 Selecting Confounders from Pre-treatment Confounders
+(1) The treatment group and control group have no significant differences in terms of gender. In the table, we can see the p value of gender(gender3) is 0.237 > 0.05. Therefore, gender variable is not counted as confounders in future analysis. All the missing indicators are insignificant, too.
+
+(2) The treatment group and control group have significant differences in academic performance and race. For reading score in fall kindergarten (C1RRSCAL), reading score in spring kindergarten (C2RRSCAL),math score in fall kindergarten (C1R2MSCL), math score in spring kindergarten (C2R2MSCL), and Grade 1 teacher’s teaching experience in years (B4YRSTC), the p values are all smaller than 0.01, which indicates that the two groups are different in terms of academic performance. Race has a P value of 0.082 which is also statistically significant. These variables are counted as confounders in future analysis.
+
+(3) The regular class group(the control group) seems to be relatively advantages. Because students in small classes had lower average scores on all academic achievement variables and teaching experience than students in regular classes.
+
+(4) I draw a table to show the variance ratio and covariance ratio of covariates between control group and treated group. In this table, the diagonal is variance ratio, others are covariance ratio.  
+all numbers in the diagonal is close to 1, which means the covariates variance between two groups are not significantly different.  
+For other numbers,  B4YRSTC:C1RRSCAL = 0.46, B4YRSTC:C2RRSCAL = -0.51, B4YRSTC:C1R2MSCL = 0.31, B4YRSTC:C2R2MSCL = 0.23, which proves these covariance are different between control and treated groups. Therefore, they should be in the form of X1X2.  
+Other numbers are all between 0.9-1, so no need to add quadratic terms.
+
+Adjusted model:  
+\( Y = \beta_0 + \beta_1 \times \text{ClassSize} + \beta_2 \times C1RRSCAL + 
+\beta_3 \times C2RRSCAL + \beta_4 \times C1R2MSCL + \beta_5 \times C2R2MSCL + 
+\beta_6 \times B4YRSTC + \beta_7 \times race6 + 
+\beta_8 \times B4YRSTC \times C1RRSCAL + 
+\beta_9 \times B4YRSTC \times C2RRSCAL + 
+\beta_{10} \times B4YRSTC \times C1R2MSCL + 
+\beta_{11} \times B4YRSTC \times C2R2MSCL \)
+```{r covariates difference}
+# Difference in X=1 and X=0 of potential confounders (pre-identified)
+covariates <- c("gender3",
+                "race6", 
+                "C1RRSCAL", # Reading score in fall kindergarten
+                "C2RRSCAL", # Reading score in spring kindergarten 
+                "C1R2MSCL", # Math score in fall kindergarten
+                "C2R2MSCL", # Math score in spring kindergarten
+                "B4YRSTC", # Grade 1 teacher’s teaching experience in years
+                "missing_B4YRSTC", 
+                "missing_C1RRSCAL", 
+                "missing_C2RRSCAL",
+                "missing_C1R2MSCL", 
+                "missing_C2R2MSCL") 
+compare <- CreateTableOne(vars = covariates, strata = "clsize", data = df_cleaned, test = TRUE)
+print(compare, showAllLevels = TRUE)
+```
+
+```{r use logit regression to identify confounders and construct propensity score}
+df_q2 <- df_cleaned %>%
+  mutate(clsize_binary = ifelse(clsize == "Small", 1, 0))
+
+# Test numerical variables to identify quadratic terms
+num_covariates <- c("C1RRSCAL", "C2RRSCAL", "C1R2MSCL", "C2R2MSCL", "B4YRSTC")
+
+# Calculate the covariance between groups
+treated_cov <- cov(df_q2[df_q2$clsize_binary == 1, num_covariates])
+control_cov <- cov(df_q2[df_q2$clsize_binary == 0, num_covariates])
+
+# Calculate the ratio of covariance
+covariance_ratio <- treated_cov / control_cov
+print(covariance_ratio)
+
+# Use logit regression to construct propensity score
+logit_treat_adjusted <- glm(clsize_binary ~
+                              C1RRSCAL + 
+                              C2RRSCAL + 
+                              C1R2MSCL + 
+                              C2R2MSCL + 
+                              B4YRSTC +
+                              B4YRSTC:C1RRSCAL + 
+                              B4YRSTC:C2RRSCAL + 
+                              B4YRSTC:C1R2MSCL + 
+                              B4YRSTC:C2R2MSCL, 
+                            data = df_q2, 
+                            family = binomial)
+
+# Report in table
+coeff_table <- summary(logit_treat_adjusted)$coefficients
+coeff_df <- as.data.frame(coeff_table)
+coeff_df$Variable <- rownames(coeff_df)
+coeff_df <- coeff_df[, c("Variable", "Estimate", "Std. Error", "z value", "Pr(>|z|)")]
+print(coeff_df)
+
+# Logit Scores, show the original linear prediction result
+df_q2$LogitScore <- predict(logit_treat_adjusted, type = "link" )
+
+# Probability of Treatment, count as propensity score
+df_q2$PropScore <- predict(logit_treat_adjusted, type = "response")
+```
+
+###### 2.2 Balance Checking of Logit Scores
+
+Based on the balance check results, there is a significant difference in LogitScore between the two groups defined by clsize_binary. The Welch’s t-test yielded a t-value of -8.30 with a p-value < 2.2e-16, indicating that the mean LogitScore differs significantly between the two groups. The confidence interval (-0.0253, -0.0156) further supports this conclusion.
+
+Additionally, the mean LogitScore for group 0 is -0.4931, while for group 1, it is -0.4726, suggesting a small but statistically significant imbalance. The histogram visualization also shows noticeable differences in distribution. Given these findings, LogitScore is not perfectly balanced across the two groups, which may require further adjustments, such as matching or weighting, to ensure comparability in causal analysis.
+
+```{r check balance}
+ggplot(df_q2, aes(x = LogitScore)) +
+  geom_histogram(fill = "cadetblue", colour = "black") +
+  facet_grid(clsize_binary ~ .)
+
+logit_summary <- df_q2 %>%
+  group_by(clsize_binary) %>%
+  summarise(
+    mean_logit = mean(LogitScore, na.rm = TRUE),
+    var_logit = var(LogitScore, na.rm = TRUE),
+    n = n()
+  )
+print(logit_summary)
+
+t_test_result <- t.test(LogitScore ~ clsize_binary, data = df_q2)
+print(t_test_result)
+```
+###### 2.3 Common Support
+
+```{r identify common support}
+# Compute the standard deviation of the propensity score (LogitScore)
+logit_sd <- sd(df_q2$LogitScore, na.rm = TRUE)
+
+# Set the caliper as 20% of the logit propensity score standard deviation
+caliper <- 0.2 * logit_sd
+
+# Get the propensity score range for the treatment and control groups
+range_treat <- range(df_q2$LogitScore[df_q2$clsize_binary == 1], na.rm = TRUE)
+range_control <- range(df_q2$LogitScore[df_q2$clsize_binary == 0], na.rm = TRUE)
+
+# Determine the common support region: 
+# Use the highest minimum and lowest maximum, adjusting for the caliper
+common_min <- max(min(range_treat), min(range_control)) - caliper
+common_max <- min(max(range_treat), max(range_control)) + caliper
+
+# Print the common support region
+cat("Common Support Region: [", common_min, ",", common_max, "]\n")
+
+# Mrk individuals whose propensity scores fall outside the common support range
+df_q2$propensity_score_outlier <- ifelse(df_q2$LogitScore < common_min | 
+                                           df_q2$LogitScore > common_max, 1, 0)
+
+# Report the number of extreme cases to be excluded
+num_extreme_cases <- sum(df_q2$propensity_score_outlier, na.rm = TRUE)
+cat("Number of extreme cases to be excluded:", num_extreme_cases, "\n")
+
+# Filter out individuals who do not fall within the common support region
+df_q2 <- df_q2 %>%
+  filter(propensity_score_outlier == 0)
+
+# Check the distribution of propensity scores after filtering
+summary(df_q2$LogitScore)
+```
+### 3. PSM (before stratification)
+###### 3.1 Propensity Score Matching and Balance Checking
+
+The balance check results show that propensity score matching significantly improved covariate balance. Standardized differences decreased to near zero, and variance ratios remained close to 1, indicating that the matching process effectively reduced baseline differences between treatment and control groups. 
+
+```{r ps score matching}
+matched <- matchit(clsize_binary ~
+                     C1RRSCAL + 
+                     C2RRSCAL + 
+                     C1R2MSCL + 
+                     C2R2MSCL + 
+                     B4YRSTC +
+                     B4YRSTC:C1RRSCAL + 
+                     B4YRSTC:C2RRSCAL + 
+                     B4YRSTC:C1R2MSCL + 
+                     B4YRSTC:C2R2MSCL, 
+                   data=df_q2, method= "nearest", distance = "glm",
+                   replace = FALSE)  
+
+# Standardized difference and the variance ratio
+balance_check <- bal.tab(matched, un = TRUE, stats = c("mean.diffs", "variance.ratios"))
+balance_df <- as.data.frame(balance_check$Balance)
+balance_comparison <- balance_df[, c("Diff.Un", "V.Ratio.Un", "Diff.Adj", "V.Ratio.Adj")]
+colnames(balance_comparison) <- c("Std_Diff_Before", "Var_Ratio_Before", 
+                                  "Std_Diff_After", "Var_Ratio_After")
+
+print(balance_comparison)
+```
+
+###### 3.2 ATT of PSM
+
+Being in a small class significantly improves student achievement, with an estimated increase of 0.676 points. The effect size, standardized by the control group’s standard deviation, is 0.047, indicating a small but meaningful positive impact.
+
+```{r estimate ATT}
+# Use matched sample to estimate the effect
+matched_data <- match.data(matched)
+reading_model <- lm(C4RRSCAL ~ clsize_binary + 
+                      C1RRSCAL + 
+                      C2RRSCAL + 
+                      C1R2MSCL + 
+                      C2R2MSCL + 
+                      B4YRSTC +
+                      B4YRSTC:C1RRSCAL + 
+                      B4YRSTC:C2RRSCAL + 
+                      B4YRSTC:C1R2MSCL + 
+                      B4YRSTC:C2R2MSCL, data = matched_data)
+
+# Extract key indicators
+model_summary <- summary(reading_model)
+coef_values <- model_summary$coefficients["clsize_binary", ]
+estimate <- coef_values["Estimate"]
+sd_control <- sd(matched_data$C4RRSCAL[matched_data$clsize_binary == 0], na.rm = TRUE)
+effect_size <- estimate / sd_control
+# Compute a table for results
+result_table <- data.frame(
+  Estimate = coef_values["Estimate"],
+  Effect_Size = effect_size,
+  Std_Error = coef_values["Std. Error"],
+  T_Value = coef_values["t value"],
+  P_Value = coef_values["Pr(>|t|)"]
+)
+
+print(result_table)
+```
+
+### 4. PSM (after stratification)
+
+###### 4.1 stratification and balance checking of PSM
+
+```{r PSM stratification and balance checking}
+df_q4 <- df_q2 %>%
+  filter(LogitScore >= common_min & LogitScore <= common_max) %>% 
+  mutate(Stratum = as.factor(as.numeric(cut(LogitScore, breaks = 5, include.lowest = TRUE))))
+
+# Check balance for each stratum(standardized mean difference, variance ratio)
+stratum_summary <- df_q4 %>%
+  group_by(Stratum) %>%
+  summarise(
+    mean_treat = mean(LogitScore[clsize_binary == 1], na.rm = TRUE),
+    mean_control = mean(LogitScore[clsize_binary == 0], na.rm = TRUE),
+    sd_treat = sd(LogitScore[clsize_binary == 1], na.rm = TRUE),
+    sd_control = sd(LogitScore[clsize_binary == 0], na.rm = TRUE),
+    var_treat = var(LogitScore[clsize_binary == 1], na.rm = TRUE),
+    var_control = var(LogitScore[clsize_binary == 0], na.rm = TRUE),
+    SMD = abs(mean_treat - mean_control) / sqrt((sd_treat + sd_control) / 2),
+    VR = var_treat / var_control
+  )
+
+# Check balance for covariates(standardized mean difference, variance ratio)
+bal.tab(clsize ~ C1RRSCAL + 
+            C2RRSCAL + 
+            C1R2MSCL + 
+            C2R2MSCL + 
+            B4YRSTC +
+            B4YRSTC:C1RRSCAL + 
+            B4YRSTC:C2RRSCAL + 
+            B4YRSTC:C1R2MSCL + 
+            B4YRSTC:C2R2MSCL,
+          data = df_q4,
+          strata  = "Stratum",
+          estimand = "ATE",
+          pool    = TRUE,
+          poly    = 2,
+          stats   = c("mean.diffs", "variance.ratios")
+          )
+
+# Check average standardized mean difference and variance ratio
+avg_SMD <- mean(stratum_summary$SMD, na.rm = TRUE)
+avg_VR <- mean(stratum_summary$VR, na.rm = TRUE)
+
+# Print results
+options(max.print = 99999)
+print(stratum_summary, n = Inf)
+avg_SMD
+avg_VR
+
+```
+###### 4.2 Trend of Reading Score in Two groups
+
+A clear trend is observed. In the first stratum, the treated group performs significantly better. As we move towards the fifth stratum, the difference becomes less pronounced.
+
+```{r  Estimate Treatment Effects within Each Stratum}
+
+# Compute the mean difference in Grade 1 reading score (C4RRSCAL) within each stratum
+treatment_effects <- df_q4 %>%  
+  group_by(Stratum) %>%
+  summarise(
+    mean_treat = mean(C4RRSCAL[clsize_binary == 1], na.rm = TRUE),
+    mean_control = mean(C4RRSCAL[clsize_binary == 0], na.rm = TRUE),
+    mean_diff = mean_treat - mean_control  # Compute mean difference (ATE)
+  )
+
+# Output Stratum-Specific Treatment Effects
+print(treatment_effects)
+
+# Plot the mean score trends for the treatment and control groups
+ggplot(treatment_effects, aes(x = as.numeric(Stratum))) +
+  geom_line(aes(y = mean_treat, color = "Treated Group"), size = 1) +  
+  geom_point(aes(y = mean_treat, color = "Treated Group"), size = 3) +
+  geom_line(aes(y = mean_control, color = "Control Group"), size = 1) +  
+  geom_point(aes(y = mean_control, color = "Control Group"), size = 3) +
+  scale_color_manual(values = c("Treated Group" = "blue", "Control Group" = "red")) +  
+  labs(title = "Stratum-Specific Treatment Effects of Class Size",
+       x = "Stratum (Propensity Score Quintile)",
+       y = "Mean Grade 1 Reading Score",
+       color = "Group") +
+  theme_minimal()
+```
+
+
+###### 4.3 ATE of PSM (Add PS Score to Model)
+
+```{r 5e}
+# Run model to calculate treatment effect
+df_q4$Stratum <- as.factor(df_q4$Stratum)
+model <- lm(C4RRSCAL ~ clsize_binary +
+              C1RRSCAL +
+              C2RRSCAL +
+              C1R2MSCL +
+              C2R2MSCL +
+              B4YRSTC +
+              B4YRSTC:C1RRSCAL + 
+              B4YRSTC:C2RRSCAL + 
+              B4YRSTC:C1R2MSCL + 
+              B4YRSTC:C2R2MSCL + Stratum, data = df_q4) 
+
+model_summary <- summary(model)
+
+# Extract results
+estimate <- model_summary$coefficients["clsize_binary", "Estimate"]
+std_error <- model_summary$coefficients["clsize_binary", "Std. Error"]
+t_value <- model_summary$coefficients["clsize_binary", "t value"]
+p_value <- model_summary$coefficients["clsize_binary", "Pr(>|t|)"]
+sd_control <- sd(df_q4$C4RRSCAL[df_q4$clsize_binary == 0], na.rm = TRUE)
+effect_size <- estimate / sd_control
+# Create data frame
+result_table <- data.frame(
+  Estimate = estimate,
+  Effect_Size = effect_size,
+  Std_Error = std_error,
+  T_Value = t_value,
+  P_Value = p_value
+)
+# Print results
+print(result_table)
+
+```
+
+### 5. IPTW
+
+The IPTW analysis results suggest that class size has a significant effect on first-grade reading achievement. The estimated average treatment effect (ATE) of being in a smaller class is 0.6194, indicating a positive impact on reading scores. This effect is statistically significant, with a p-value of 0.0067, suggesting strong evidence that class size influences student performance rather than being a result of random variation.
+
+Balance diagnostics show that covariates are well balanced after weighting, as all standardized mean differences (SMDs) are below 0.05. The effective sample sizes after weighting remain substantial, with 8,630.55 in the control group and 5,299.41 in the treated group, ensuring reliable estimation. Additionally, the weighted regression results show that the absolute standardized difference is reduced to nearly 0.0018, and the variance ratio is close to 1, further supporting the success of the weighting procedure.
+
+The estimated effect size is relatively small at 0.0476, meaning that while the impact of class size on reading achievement is statistically significant, its magnitude is modest. This finding suggests that reducing class size does contribute to improved reading scores, but the effect size indicates that other factors may also play a crucial role in student performance.
+
+###### 5.1 IPTW Weighting
+
+```{r calculate IPTW weight}
+# Compute IPTW weights for ATE
+df_q5 <- df_q4 %>%
+  mutate(
+    pred = PropScore,
+    Z = clsize_binary,
+    W_ATE = ifelse(Z == 1, mean(Z) / pred, (1 - mean(Z)) / (1 - pred)),
+    logit_PS = log(PropScore / (1 - PropScore))  # Compute logit propensity score
+  )
+
+# Unweighted logit PS regression (checking PS balance before weighting)
+lm_logit_before <- lm(logit_PS ~ Z, data = df_q5)
+
+# Weighted logit PS regression (checking PS balance after weighting)
+lm_logit_after <- lm(logit_PS ~ Z, data = df_q5, weights = W_ATE)
+
+# Balance check before weighting
+bal_before <- bal.tab(Z ~ C1RRSCAL + C2RRSCAL + C1R2MSCL + C2R2MSCL + B4YRSTC +
+                         B4YRSTC:C1RRSCAL + B4YRSTC:C2RRSCAL + 
+                         B4YRSTC:C1R2MSCL + B4YRSTC:C2R2MSCL,
+                       data = df_q5,
+                       estimand = "ATE",
+                       m.threshold = 0.05,
+                       disp.v.ratio = TRUE)
+
+# Balance check after weighting
+bal_after <- bal.tab(Z ~ C1RRSCAL + C2RRSCAL + C1R2MSCL + C2R2MSCL + B4YRSTC +
+                         B4YRSTC:C1RRSCAL + B4YRSTC:C2RRSCAL + 
+                         B4YRSTC:C1R2MSCL + B4YRSTC:C2R2MSCL,
+                       data = df_q5,
+                       estimand = "ATE",
+                       m.threshold = 0.05,
+                       disp.v.ratio = TRUE,
+                       weights = df_q5$W_ATE,
+                       method = "weighting")
+
+# Print balance check results
+print(bal_after)
+
+# Extract balance summary
+balance_summary <- data.frame(
+  Measure = c("Regression Coefficient (Z)", "Std. Error", "P-value",
+              "Avg. Abs. Std. Diff", "Avg. Variance Ratio"),
+  Unweighted = c(
+    coef(lm_logit_before)["Z"],
+    summary(lm_logit_before)$coefficients["Z", "Std. Error"],
+    summary(lm_logit_before)$coefficients["Z", "Pr(>|t|)"],
+    mean(abs(bal_before$Balance$Diff.Un)),  # Average standardized mean difference (Unweighted)
+    mean(bal_before$Balance$V.Ratio.Un)  # Average variance ratio (Unweighted)
+  ),
+  Weighted = c(
+    coef(lm_logit_after)["Z"],
+    summary(lm_logit_after)$coefficients["Z", "Std. Error"],
+    summary(lm_logit_after)$coefficients["Z", "Pr(>|t|)"],
+    mean(abs(bal_after$Balance$Diff.Adj)),  # Average standardized mean difference (Weighted)
+    mean(bal_after$Balance$V.Ratio.Adj)  # Average variance ratio (Weighted)  
+  )
+)
+
+# Print final balance summary table
+print(balance_summary)
+```
+
+###### 5.2 IPTW ATE
+
+```{r Estimate ATE using IPTW}
+# Perform IPTW-weighted regression
+ate_model <- lm(C4RRSCAL ~ clsize_binary, data = df_q5, weights = W_ATE)
+
+# Extract regression results for the treatment effect
+estimate <- coef(ate_model)["clsize_binary"]  # Estimated ATE
+std_error <- summary(ate_model)$coefficients["clsize_binary", "Std. Error"]  # Standard error
+t_value <- summary(ate_model)$coefficients["clsize_binary", "t value"]  # t-statistic
+p_value <- summary(ate_model)$coefficients["clsize_binary", "Pr(>|t|)"]  # p-value
+
+# Compute effect size (Cohen's d) using the standard deviation of the control group
+sd_control <- sd(df_q5$C4RRSCAL[df_q5$clsize_binary == 0], na.rm = TRUE)
+cohen_d <- estimate / sd_control  # Standardized effect size
+
+# Create a results table
+results <- data.frame(
+  Estimate = estimate,
+  Std_Error = std_error,
+  t_value = t_value,
+  p_value = p_value,
+  Effect_Size = cohen_d
+)
+
+# Print results in a formatted table
+kable(results, caption = "ATE Estimation Results for Class Size on Grade 1 Reading Achievement")
+```
+
+### 6. MMWS
+
+The MMWS analysis results indicate that class size has a statistically significant effect on first-grade reading achievement. The estimated ATE is 0.6061, suggesting that being in a smaller class leads to an increase in reading scores. The p-value is 3.41e-05, which confirms that this effect is unlikely to be due to chance.
+
+The balance diagnostics show that the weighting procedure effectively reduced covariate imbalances, with an average standardized mean difference (SMD) of 0.0039 and a variance ratio close to 1, indicating a well-balanced sample. This ensures that the estimated treatment effect is not driven by pre-existing differences between the groups.
+
+The effect size is 0.0496, which is small but consistent with prior findings on class size effects. This suggests that while reducing class size does have a positive impact on reading achievement, the practical significance might be limited, and other factors likely contribute to student performance.
+
+###### 6.1 MMWS Weighting
+
+```{r calculate MMWS}
+
+# Construct weight
+df_q6 <- df_q2 %>%
+  filter(LogitScore >= common_min & LogitScore <= common_max) %>% 
+  mutate(Stratum = as.factor(cut(LogitScore, breaks = quantile(LogitScore, probs = seq(0, 1, 0.2)), include.lowest = TRUE)))
+
+df_q6 <- df_q6 %>%
+  group_by(Stratum) %>%
+  mutate(
+    n_treated = sum(clsize_binary == 1),
+    n_control = sum(clsize_binary == 0),
+    MMWS_weight = case_when(
+      clsize_binary == 1 & n_treated > 0 ~ n() / n_treated,
+      clsize_binary == 0 & n_control > 0 ~ n() / n_control,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+
+mmws_model <- lm(C4RRSCAL ~ clsize_binary, data = df_q6, weights = MMWS_weight)
+summary(mmws_model)
+
+# Calculate covariate balance
+bal_results_mmws <- bal.tab(clsize_binary ~ C1RRSCAL + 
+                              C2RRSCAL + 
+                              C1R2MSCL + 
+                              C2R2MSCL + 
+                              B4YRSTC + 
+                              B4YRSTC:C1RRSCAL + 
+                              B4YRSTC:C2RRSCAL +
+                              B4YRSTC:C1R2MSCL + 
+                              B4YRSTC:C2R2MSCL,
+                            data = df_q6, weights = df_q6$MMWS_weight, un = TRUE,
+                            disp.v.ratio = TRUE, disp.cov.ratio = TRUE, 
+                            s.d.denom = "pooled")
+
+# Check Balance of Logit Propensity Score
+logit_ps_model_unweighted <- lm(LogitScore ~ clsize_binary, data = df_q6)
+logit_ps_model_weighted <- lm(LogitScore ~ clsize_binary, data = df_q6, weights = MMWS_weight)
+
+
+balance_summary_mmws <- data.frame(
+  Measure = c("Regression Coefficient (Z)", "Std. Error", "P-value",
+              "Avg. Abs. Std. Diff", "Avg. Variance Ratio"),
+  Unweighted = c(
+    coef(logit_ps_model_unweighted)["clsize_binary"],
+    summary(logit_ps_model_unweighted)$coefficients["clsize_binary", "Std. Error"],
+    summary(logit_ps_model_unweighted)$coefficients["clsize_binary", "Pr(>|t|)"],
+    mean(abs(bal_results_mmws$Balance$Diff.Un)), 
+    mean(bal_results_mmws$Balance$V.Ratio.Un) 
+  ),
+  Weighted = c(
+    coef(logit_ps_model_weighted)["clsize_binary"],
+    summary(logit_ps_model_weighted)$coefficients["clsize_binary", "Std. Error"],
+    summary(logit_ps_model_weighted)$coefficients["clsize_binary", "Pr(>|t|)"],
+    mean(abs(bal_results_mmws$Balance$Diff.Adj)), 
+    mean(bal_results_mmws$Balance$V.Ratio.Adj)  
+  )
+)
+
+# Print the table
+print(balance_summary_mmws)
+
+```
+
+###### 6.1 MMWS ATE
+
+```{r MMWS estimate ATE}
+
+# Make sure MMWS doesn't have NA
+df_q6 <- df_q6 %>%
+  filter(!is.na(MMWS_weight))
+
+# Estimate ATE
+mmws_model <- lm(C4RRSCAL ~ clsize_binary +
+                   C1RRSCAL +
+                   C2RRSCAL +
+                   C1R2MSCL +
+                   C2R2MSCL +
+                   B4YRSTC +
+                   B4YRSTC:C1RRSCAL + 
+                   B4YRSTC:C2RRSCAL + 
+                   B4YRSTC:C1R2MSCL + 
+                   B4YRSTC:C2R2MSCL, data = df_q6, weights = MMWS_weight)
+
+# Extract results
+estimate <- coef(mmws_model)["clsize_binary"]
+std_dev <- summary(mmws_model)$sigma
+t_value <- summary(mmws_model)$coefficients["clsize_binary", "t value"]
+p_value <- summary(mmws_model)$coefficients["clsize_binary", "Pr(>|t|)"]
+cohen_d <- estimate / std_dev
+
+# Create result table
+results <- data.frame(
+  Estimate = estimate,
+  Std_Deviation = std_dev,
+  t_value = t_value,
+  p_value = p_value,
+  Effect_Size = cohen_d
+)
+# Print the table
+kable(results, caption = "MMWS Estimation Results for Class Size on Grade 1 Reading Achievement")
+
+```
+### 7. Instrumental Variable Method(IV)
+
+**Model**:  
+
+\[
+Y_i = \beta_0^{IV} + \beta_1^{IV} \hat{D}_i + X_i' \delta + \epsilon_i
+\]
+
+In the first stage, the instrument (“Z,” defined as public school enrollment) shows a strong correlation with the endogenous regressor (Grade 1 class size, “D”). This is evident from the high first-stage F-statistic (about 67.65), which comfortably exceeds the common threshold of 10 for detecting weak instruments. Thus, Z appears strong in terms of predictive power for class size. In the second stage, the coefficient on class size (“D”) is negative and statistically significant, suggesting that as class size increases, reading achievement tends to decrease—consistent with the idea that larger classes can be detrimental to student performance.
+
+However, the Sargan (or overidentification) test yields a very low p-value, indicating potential concerns about the instrument’s validity or unaccounted-for violations of the exclusion restriction. Moreover, the Wu-Hausman test shows no significant difference between the OLS and IV estimates (p-value = 1), suggesting that either endogeneity is not a major issue in this setting, or that the instrument does not substantially improve upon OLS in controlling for any endogeneity that may exist. Taken together, these results imply that the validity of IV may be questionable.
+
+
+
+```{r IV}
+df_q7 <- df_cleaned %>%
+  filter(s4pupri == 1,  # Select only public school students
+         !is.na(C4RRSCAL), # Exclude individuals with no reading score
+         !is.na(clsize), # Ensure valid Grade 1 class size
+         !is.na(s4anumch), # Ensure valid public school enrollment
+         !is.na(A4CLSIZE)) %>% # Ensure valid Grade 1 class size
+  mutate(Z = s4anumch, # Define instrument variable (public school enrollment)
+         D = A4CLSIZE, # Define endogenous variable (Grade 1 class size)
+         race6 = as.factor(race6), # Convert race to a factor variable
+         gender3 = as.factor(gender3)) # Convert gender to a factor variable
+
+# Step 1: Regress Y (reading achievement) on D and adjust for X
+Q7_first_stage <- lm(D ~ Z + 
+                       gender3 +
+                       race6 +
+                       w1sesl +
+                       C1RRSCAL +
+                       C2RRSCAL, data = df_q7)
+
+# Extract F-statistic to check for weak instruments
+first_stage_summary <- summary(Q7_first_stage)
+first_stage_F <- first_stage_summary$fstatistic[1]
+cat("First-stage regression F-statistic:", first_stage_F, "\n")
+
+# Step 2: 2SLS method
+Q7_second_stage <- ivreg(C4RRSCAL ~ D + 
+                       gender3 + 
+                       race6 + 
+                       w1sesl + 
+                       C1RRSCAL + 
+                       C2RRSCAL | 
+                      Z + 
+                       gender3 + 
+                       race6 + 
+                       w1sesl + 
+                       C1RRSCAL + 
+                       C2RRSCAL, data = df_q7)
+
+# Over Identification Test
+sargan_test <- bptest(Q7_second_stage)  # Sargan test (based on Breusch-Pagan)
+cat("Sargan test results:\n")
+print(sargan_test)
+
+# Endogeneity Test
+ols_model <- lm(C4RRSCAL ~ D + gender3 + race6 + w1sesl + C1RRSCAL + C2RRSCAL, data = df_q7)
+wu_hausman_test <- hausman.systemfit(Q7_second_stage, Q7_first_stage)  # Wu-Hausman test
+cat("Wu-Hausman test results:\n")
+print(wu_hausman_test)
+
+# Show Results
+Q7_first_stage_results <- tidy(Q7_first_stage)
+Q7_second_stage_results <- tidy(Q7_second_stage)
+
+# Display first-stage regression results
+kable(Q7_first_stage_results, format = "html", digits = 3) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover"))
+
+# Display second-stage regression results
+kable(Q7_second_stage_results, format = "html", digits = 3) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover"))
+
+# Show effect size of 2sls
+beta_1_iv <- Q7_second_stage_results$estimate[2]  
+
+# Compute effect size
+sd_Q7_Y_control <- sd(df_q7$C4RRSCAL[df_q7$clsize == "Regular"], na.rm = TRUE)
+Q7_effect_size <- beta_1_iv / sd_Q7_Y_control
+Q7_effect_size
+```
+### 8. Difference in Difference Method(DID)
+
+**Model**:  
+
+\[
+Y_{it} = \alpha + \beta_1\, \text{SmallClass}_i + \beta_2\, \text{Post}_t + \delta\, (\text{SmallClass}_i \times \text{Post}_t) + \varepsilon_{it},
+\]
+
+**ATT**:  
+
+\[
+ATT = \delta = (\overline{C4RRSCAL}_{\text{small}} - \overline{C2RRSCAL}_{\text{small}}) - (\overline{C4RRSCAL}_{\text{regular}} - \overline{C2RRSCAL}_{\text{regular}}).
+\]
+
+In a standard Difference-in-Differences framework, the main requirement is the parallel trends assumption, meaning that in the absence of the intervention, the outcome (in this case, reading achievement) would have evolved similarly for the treatment and control groups.  
+The results indicate that, at baseline, the control group’s reading score is around 34.061, and from baseline to post-intervention, this score increases by about 22.758. The coefficient on clsize_new is -0.711, suggesting that at baseline, the group with the new (or smaller) class size starts off slightly lower than the control group. However, the crucial DID interaction term time_binary:clsize_new is 0.590 (p = 0.044), indicating that, after the intervention, the treatment group sees an additional 0.590-point improvement beyond what the control group experiences. Interpreted under the parallel trends assumption, this implies that reducing class size or adopting the new arrangement exerts a positive and statistically significant effect on students’ reading scores.  
+
+```{r DID}
+# Generate DID variable
+df_q8 <- df_cleaned %>%
+  mutate(
+    clsize_new = if_else(A4CLSIZE <= 19, 1, if_else(A4CLSIZE >= 20, 0, NA_real_)) # Define small class vs. large class
+  ) %>%
+  filter(!is.na(clsize_new)) %>%
+  # Reshape data for different time periods
+  pivot_longer(cols = c(C2RRSCAL, C4RRSCAL), 
+               names_to = "time", values_to = "reading_score") %>%
+  mutate(
+    time_binary = if_else(time == "C2RRSCAL", 0, 1) # 0 = Kindergarten, 1 = Grade 1
+  )
+
+# Run DID model
+did_model <- feols(reading_score ~ time_binary + clsize_new + time_binary:clsize_new, data = df_q8)
+
+# Extract results and format output
+did_results <- tidy(did_model)
+kable(did_results, format = "html", digits = 3, caption = "Basic DID Regression Results") %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover"))
+```
+### 9. Conclusion
+
+PSM, IPTW, and MMWS are observational research methods based on propensity scores that require no unobserved confounding between the treatment and the outcome after controlling for the observed covariates. PSM achieves group comparability through matching, IPTW retains a larger sample by using weighting, and MMWS combines the advantages of stratification and weighting. The IV (instrumental variable) method primarily relies on the assumptions of instrument exogeneity and relevance, allowing it to identify the treatment effect even when unobserved confounding is present, but it requires finding a suitable and valid instrument. DID (difference-in-differences) assumes that, in the absence of the intervention, the treatment and control groups would have followed the same trend, thereby identifying causal effects by comparing the differences before and after the intervention.
+
+Each of these methods has its own strengths. Propensity score–based methods require the strong ignorability assumption. PSM is simple and intuitive, making it easy to understand, and matching ensures that the baseline characteristics between groups are well balanced. IPTW does not require discarding observations, making it suitable for large sample sizes and allowing for the estimation of the population average treatment effect. MMWS stratifies the sample by propensity score and then applies weighting, enabling a more flexible examination of heterogeneous effects within each stratum. The IV method can identify causal effects even in the presence of severe endogeneity and when it is difficult to observe all confounding factors, providing a powerful tool for addressing endogeneity issues common in educational research. DID leverages the time dimension before and after a policy or intervention to control for potential confounders that remain constant over time, and as long as the parallel trends assumption holds, it can eliminate interference from many unobserved individual characteristics.
+
+In terms of results, the estimates from PSM, IPTW, and MMWS are relatively close (around 0.045 to 0.05), all indicating that a reduction in class size has a clear positive effect on reading achievement, with effect sizes in a similar range. The regression coefficient from the IV method may differ slightly in magnitude or sign compared to the other methods, primarily because the enrollment rate is a weak instrument. Nevertheless, the overall direction still supports the positive impact of small class teaching on reading achievement. Similarly, the DID results show that, after the intervention, the small class group experienced an additional significant gain in reading scores compared to the large class group, which is consistent with the conclusions drawn from the other methods.
+
+In summary, these five methods—each based on different assumptions and estimation frameworks—have all yielded similar conclusions that small class teaching has a positive effect on first-grade students’ reading achievement, demonstrating that this finding is both robust and consistent. Based on these research results, it can be preliminarily concluded that reducing class size is an educational intervention that positively enhances early reading skills. Future research could further validate its external validity across a broader scope or additional subjects and rigorously test the key assumptions of each method, thereby providing more comprehensive evidence for educational policy-making.
+
+```{r summarize results}
+df <- data.frame(
+  Method    = c("PSM", "IPTW", "MMWS", "IV", "DID"),
+  Estimate  = c(0.5984877, 0.6194184, 0.6600558, 0.329, 0.590),
+  Std.Error = c(0.1500921, 0.2283129, 12.230558, 0.104, 0.294),
+  p.value   = c(6.712134e-05, 0.0066754, 3.41e-05, 0.002, 0.044)
+)
+
+kable(
+  df,
+  caption = "Estimation Results for Class Size on Grade 1 Reading Achievement",
+  digits = 4
+)
+```
+
